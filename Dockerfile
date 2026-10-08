@@ -33,11 +33,12 @@ FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 # ca-certificates : connexions TLS (telechargement des modeles IA, IPFS).
+# curl : telechargement du modele IA depuis Hugging Face par l'entrypoint.
 # libgomp1 : demande par le moteur d'inference (libkeryx-llama.so).
 # Le pilote NVIDIA (libcuda) n'est PAS dans l'image : vast.ai l'injecte au
 # lancement. Les librairies CUDA (cuBLAS, cudart) sont livrees avec le mineur.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=fetch /opt/miners /opt/miners

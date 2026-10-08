@@ -33,6 +33,9 @@ Pour passer à une nouvelle version du mineur, relance simplement le workflow, p
    (`clusmi`) et `DOCKERHUB_TOKEN` (les mêmes que pour rentingminers).
 3. Onglet **Actions** → *Construire et publier l'image* → **Run workflow**.
 
+Au démarrage, l'image télécharge aussi le modèle IA depuis Hugging Face, bien plus vite
+que le mineur (voir [plus bas](#modèle-ia--téléchargement-rapide)).
+
 ## Variables
 
 | Variable | Valeurs | Rôle |
@@ -85,14 +88,47 @@ seule passe et le mineur écarte les autres. L'hôte vast.ai peut lire les varia
 conteneur : la clé escrow ne donne accès qu'aux gains en attente de réclamation, pas à
 ton wallet.
 
+## Modèle IA : téléchargement rapide
+
+keryx-miner télécharge son modèle depuis la passerelle IPFS de Keryx, souvent très lente,
+et cette adresse est écrite en dur dans le mineur. Keryx-Labs publie les mêmes modèles
+sur [Hugging Face](https://huggingface.co/datasets/Keryx-Labs/models) : avant de lancer le
+mineur, l'image y télécharge le modèle du palier choisi dans `GPU_ARGS`.
+
+| Option dans `GPU_ARGS` | Modèle | Taille |
+|---|---|---|
+| aucune (palier par défaut) | Gemma-4-12B-abliterated | 9,8 Go |
+| `--very-light` | Qwen3.5-9B-abliterated | 6,5 Go |
+| `--light` | GLM-4-9B-0414 | 8,3 Go |
+| `--high` | Qwen3.6-27B **et** Qwen3.8-27B (modèle à partir du hard fork H14) | 16,5 + 16,8 Go |
+| `--very-high` | Kimi-Linear-48B | 29,7 Go |
+| `--force-model a,b` | les modèles des paliers listés, en plus du palier ci-dessus | |
+
+- Les zips de Hugging Face ne sont pas compressés : l'image télécharge seulement la partie
+  qui contient `model.gguf`, directement dans `/opt/miners/keryx/models/<modèle>/` (ou le
+  dossier de `--models-dir`). Pas de décompression, pas besoin de deux fois la place.
+- Coupure : le téléchargement reprend là où il s'était arrêté (5 essais de suite sans
+  progrès au maximum, puis au prochain démarrage). Moins de 1 Mo/s pendant 60 s : la
+  connexion est relancée.
+- Une ligne de progression toutes les 30 s dans les logs (Go, %, Mo/s).
+- Un modèle déjà présent n'est pas retéléchargé. S'il manque de la place sur le disque,
+  le log le dit (taille nécessaire et place restante).
+- **Aucun risque de mauvais modèle** : keryx-miner vérifie lui-même l'empreinte du
+  fichier avec celle inscrite dans son code. Si Hugging Face est injoignable ou que
+  quelque chose ne va pas, keryx-miner télécharge lui-même par IPFS, comme avant (il
+  reprend un fichier partiel).
+
+Le palier vient de l'option ; la mémoire de la carte ne fait que le baisser si le modèle
+ne tient pas. Sans option, une RTX 5090 (32 Go) mine donc avec Gemma, le palier par défaut. D'après le README de Keryx, plus le
+palier est haut, plus la part de récompense est grande ; `--very-high` (Kimi) est le plus
+haut.
+
 ## Ce qu'il faut savoir
 
-- **Machines de 8 cartes** : keryx-miner mine sur toutes les cartes visibles et choisit le
-  palier de modèle IA de chaque carte selon sa mémoire (les options `--very-light`,
-  `--light`, `--high`, `--very-high` et `--force-model` vont dans `GPU_ARGS`).
-- **Modèle IA** : il est téléchargé au premier démarrage, une seule fois pour toutes les
-  cartes, dans `/opt/miners/keryx/models`. Sur des cartes de 32 Go (RTX 5090), c'est
-  Kimi-Linear-48B, soit 30 Go : prévois **au moins 50 Go de disque** sur l'instance.
+- **Machines de 8 cartes** : keryx-miner mine sur toutes les cartes visibles ; le modèle
+  est téléchargé une seule fois pour toutes les cartes.
+- **Disque** : prévois la taille du modèle plus de la marge, par exemple **au moins 40 Go**
+  avec `--very-high` (Kimi, 30 Go) et 50 Go avec `--high` (deux modèles de 16 Go).
 - **Fichiers du mineur** (`escrow.key`, `escrow.cert`, `escrow_state.json`…) : ils sont
   écrits dans le dossier de travail du conteneur, `/opt/miners/work`.
 - **Logs** : tout ce qu'écrit keryx-miner apparaît dans les logs de l'instance vast.ai ;
@@ -102,7 +138,8 @@ ton wallet.
 
 ## Tester sans miner
 
-- `DRY_RUN=1` : la commande complète s'affiche dans les logs, puis le conteneur s'arrête.
+- `DRY_RUN=1` : les commandes complètes et le ou les modèles prévus s'affichent dans les
+  logs, puis le conteneur s'arrête.
 - `docker run --rm clusmi/vastkeryx --help` : aide de keryx-miner (il lui faut un GPU
   NVIDIA, donc `--gpus all`).
 - `docker run --rm -it clusmi/vastkeryx bash` : un shell dans l'image.

@@ -17,6 +17,9 @@
 # retrouver, via l'API Keryx, les gains en attente sur cette cle (y compris ceux
 # laisses par des instances detruites). En cas d'echec, le minage demarre quand meme.
 #
+# Ensuite, le modele IA du palier choisi dans GPU_ARGS est telecharge depuis Hugging
+# Face (bien plus rapide que la passerelle IPFS du mineur), s'il n'est pas deja la.
+#
 # Avec des arguments (docker run image --help), keryx-miner est lance
 # directement avec ces arguments ; une commande (bash, nvidia-smi) est executee.
 set -uo pipefail
@@ -223,7 +226,215 @@ recover_escrow() {
   fi
 }
 
+# --- Modele IA : telechargement depuis Hugging Face ------------------------------
+# keryx-miner telecharge son modele depuis la passerelle IPFS de Keryx, souvent tres
+# lente. Keryx-Labs publie les memes modeles sur Hugging Face, dans des zips sans
+# compression : l'image telecharge directement la partie du zip qui contient
+# model.gguf, a l'endroit ou le mineur le cherche, avec reprise en cas de coupure.
+# Le mineur verifie ensuite l'empreinte du fichier (celle inscrite dans son code) ;
+# si quelque chose echoue ici, il telecharge lui-meme comme avant.
+# KERYX_MODELS_URL ne sert qu'aux tests de l'image.
+models_url="${KERYX_MODELS_URL:-https://huggingface.co/datasets/Keryx-Labs/models/resolve/main}"
+
+# Palier de keryx-miner -> modele(s) (nom du zip sur Hugging Face).
+# high : tant qu'il ne connait pas la hauteur de la chaine, le mineur veut aussi le
+# modele de l'ere suivante (Qwen3.8-27B a partir du hard fork H14).
+declare -A tier_models=(
+  [very-light]="Qwen3.5-9B-abliterated"
+  [light]="GLM-4-9B-0414"
+  [default]="Gemma-4-12B-abliterated"
+  [high]="Qwen3.6-27B Qwen3.8-27B"
+  [very-high]="Kimi-Linear-48B"
+)
+
+# Dossier des modeles : --models-dir, sinon KERYX_MODELS_DIR, sinon <dossier du mineur>/models.
+models_opt=$(opt_value --models-dir "${gpu_user[@]}")
+if [[ -n "$models_opt" ]]; then
+  models_root=$(abs_path "$models_opt")
+elif [[ -n "${KERYX_MODELS_DIR:-}" ]]; then
+  models_root=$(abs_path "$KERYX_MODELS_DIR")
+else
+  models_root="$MINERS_DIR/keryx/models"
+fi
+
+# Palier demande dans GPU_ARGS (aucune option = default), plus ceux de --force-model.
+base_tier=default
+for t in very-light light high very-high; do
+  has_opt "--$t" "${gpu_user[@]}" && base_tier=$t
+done
+wanted_tiers=("$base_tier")
+forced=$(opt_value --force-model "${gpu_user[@]}")
+if [[ -n "$forced" ]]; then
+  IFS=',' read -r -a forced_list <<< "$forced"
+  for t in "${forced_list[@]}"; do
+    t=$(lower "${t//[[:space:]]/}")
+    [[ -n "${tier_models[$t]:-}" ]] && wanted_tiers+=("$t")
+  done
+fi
+wanted_models=()
+for t in "${wanted_tiers[@]}"; do
+  for m in ${tier_models[$t]}; do
+    [[ " ${wanted_models[*]} " == *" $m "* ]] || wanted_models+=("$m")
+  done
+done
+
+gb() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1e9 }'; }
+
+# Entier non signe little-endian de $2 octets a la position $1 du fichier $zhdr.
+le_u() { od -An -tu"$2" -j"$1" -N"$2" "$zhdr" | tr -d ' \n'; }
+
+# Lit les en-tetes locaux au debut d'un zip ($1 : les premiers Ko du zip) jusqu'a
+# l'entree */model.gguf. Resultat : zip_start (premier octet de model.gguf dans le
+# zip), zip_size, zip_folder. Refuse tout ce qui n'est pas stocke sans compression.
+parse_zip_head() {
+  local zhdr="$1" off=0 hsize sig flags method csize usize nlen xlen name xoff xend p q id sz
+  hsize=$(stat -c%s "$zhdr")
+  while (( off + 30 <= hsize )); do
+    sig=$(od -An -tx4 -j"$off" -N4 "$zhdr" | tr -d ' \n')
+    [[ "$sig" == 04034b50 ]] || return 1
+    flags=$(le_u $((off + 6)) 2)
+    method=$(le_u $((off + 8)) 2)
+    csize=$(le_u $((off + 18)) 4)
+    usize=$(le_u $((off + 22)) 4)
+    nlen=$(le_u $((off + 26)) 2)
+    xlen=$(le_u $((off + 28)) 2)
+    xoff=$((off + 30 + nlen))
+    xend=$((xoff + xlen))
+    (( xend <= hsize )) || return 1
+    name=$(dd if="$zhdr" bs=1 skip=$((off + 30)) count="$nlen" 2>/dev/null)
+    # Fichier de plus de 4 Go : vraies tailles dans le champ zip64 (id 1) des extras.
+    if (( usize == 4294967295 || csize == 4294967295 )); then
+      p=$xoff
+      while (( p + 4 <= xend )); do
+        id=$(le_u "$p" 2)
+        sz=$(le_u $((p + 2)) 2)
+        if (( id == 1 )); then
+          q=$((p + 4))
+          if (( usize == 4294967295 )); then usize=$(le_u "$q" 8); q=$((q + 8)); fi
+          if (( csize == 4294967295 )); then csize=$(le_u "$q" 8); fi
+          break
+        fi
+        p=$((p + 4 + sz))
+      done
+    fi
+    (( (flags & 8) == 0 )) || return 1
+    if [[ "$name" == */model.gguf ]]; then
+      (( method == 0 && csize == usize && usize > 0 )) || return 1
+      zip_start=$xend
+      zip_size=$usize
+      zip_folder="${name%/model.gguf}"
+      return 0
+    fi
+    off=$((xend + csize))
+  done
+  return 1
+}
+
+# Une ligne de progression toutes les 30 s : $1 nom, $2 fichier, $3 taille finale.
+progress_loop() {
+  local name="$1" file="$2" total="$3" prev cur t0 t1
+  prev=$(stat -c%s "$file" 2>/dev/null || echo 0)
+  t0=$(date +%s)
+  while sleep 30; do
+    cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    t1=$(date +%s)
+    awk -v n="$name" -v c="$cur" -v T="$total" -v p="$prev" -v dt=$((t1 - t0)) 'BEGIN {
+      if (dt < 1) dt = 1
+      printf "[vastkeryx] Modele %s : %.1f / %.1f Go (%d %%), %.0f Mo/s\n", n, c / 1e9, T / 1e9, 100 * c / T, (c - p) / 1e6 / dt }'
+    prev=$cur
+    t0=$t1
+  done
+}
+
+# Telecharge le modele $1 (nom du zip). Vrai si model.gguf est complet a la fin ;
+# sinon keryx-miner reprendra lui-meme (il continue un fichier partiel).
+fetch_model() {
+  local name="$1" url="$models_url/$1.zip" hdrf errf dir dest have before avail http rc fails=0 t0 prog
+  if [[ -f "$models_root/$name/.ok" && -f "$models_root/$name/model.gguf" ]]; then
+    log "Modele $name : deja present et verifie par keryx-miner."
+    return 0
+  fi
+  hdrf=$(mktemp)
+  # --max-filesize : si le serveur ignorait la plage demandee, on ne telecharge pas tout.
+  if ! curl -fsSL --retry 3 --connect-timeout 30 --max-time 120 --max-filesize 1048576 \
+       -r 0-65535 -o "$hdrf" "$url"; then
+    rm -f "$hdrf"
+    log "Modele $name : Hugging Face injoignable ou reponse inattendue ; keryx-miner le telechargera lui-meme (IPFS)."
+    return 1
+  fi
+  if ! parse_zip_head "$hdrf" || [[ ! "$zip_folder" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    rm -f "$hdrf"
+    log "Modele $name : zip au format inattendu ; keryx-miner le telechargera lui-meme (IPFS)."
+    return 1
+  fi
+  rm -f "$hdrf"
+
+  dir="$models_root/$zip_folder"
+  dest="$dir/model.gguf"
+  mkdir -p "$dir" || { log "Modele $name : impossible de creer $dir."; return 1; }
+  have=0
+  [[ -f "$dest" ]] && have=$(stat -c%s "$dest")
+  if (( have == zip_size )); then
+    log "Modele $name : deja telecharge ($(gb "$zip_size") Go)."
+    return 0
+  fi
+  if (( have > zip_size )); then
+    rm -f "$dest"
+    have=0
+  fi
+  avail=$(df -PB1 "$dir" | awk 'NR == 2 { print $4 }')
+  if (( avail < zip_size - have + 1000000000 )); then
+    log "Modele $name : ERREUR, disque insuffisant : il faut $(gb $((zip_size - have))) Go (+1 Go de marge), il reste $(gb "$avail") Go. Prends plus de disque sur l'instance."
+    return 1
+  fi
+  if (( have > 0 )); then
+    log "Modele $name : reprise a $(gb "$have") / $(gb "$zip_size") Go depuis Hugging Face..."
+  else
+    log "Modele $name : telechargement de $(gb "$zip_size") Go depuis Hugging Face vers $dest..."
+  fi
+
+  errf=$(mktemp)
+  t0=$(date +%s)
+  phase=download
+  progress_loop "$name" "$dest" "$zip_size" &
+  prog=$!
+  # Plage exacte de model.gguf dans le zip, ajoutee a la suite du fichier. Une reponse
+  # autre que 206 (plage ignoree) est annulee. Moins de 1 Mo/s pendant 60 s : on
+  # coupe et on reprend. Abandon apres 5 essais de suite sans progres.
+  while (( have < zip_size && fails < 5 )); do
+    before=$have
+    curl -fsSL --connect-timeout 30 --speed-limit 1048576 --speed-time 60 \
+         -r "$((zip_start + have))-$((zip_start + zip_size - 1))" \
+         -w '%{stderr}%{http_code}\n' "$url" >> "$dest" 2> "$errf" &
+    pid=$!
+    wait "$pid"
+    rc=$?
+    pid=0
+    http=$(tail -n 1 "$errf")
+    if [[ "$http" != 206 ]]; then
+      truncate -s "$before" "$dest"
+    fi
+    have=$(stat -c%s "$dest")
+    if (( have > before )); then fails=0; else fails=$((fails + 1)); fi
+    if (( have < zip_size )); then
+      log "Modele $name : coupure a $(gb "$have") Go (curl code $rc, HTTP ${http:-?}) ; reprise dans 5 s."
+      sleep 5 & wait $!
+    fi
+  done
+  kill "$prog" 2>/dev/null
+  wait "$prog" 2>/dev/null
+  phase=""
+  rm -f "$errf"
+  if (( have == zip_size )); then
+    log "Modele $name : telecharge en $(( ($(date +%s) - t0) / 60 )) min ; keryx-miner va verifier son empreinte."
+    return 0
+  fi
+  log "Modele $name : echec apres plusieurs essais ($(gb "$have") / $(gb "$zip_size") Go) ; keryx-miner continuera le telechargement lui-meme (IPFS)."
+  return 1
+}
+
 if [[ $dry_run -eq 1 ]]; then
+  log "Modele(s) pour ce palier (${wanted_tiers[*]}) : ${wanted_models[*]} -> $models_root (depuis Hugging Face)"
   if [[ -n "$escrow_key" ]]; then
     log "Escrow : KERYX_ESCROW_KEY valide, serait ecrite dans $key_file (DRY_RUN : rien n'est ecrit)."
   else
@@ -255,6 +466,11 @@ stop() {
     log "Arret demande pendant la recuperation escrow : abandonnee."
     exit 0
   fi
+  # Pendant le telechargement du modele : le fichier partiel reste, il sera repris.
+  if [[ "$phase" == download ]]; then
+    log "Arret demande pendant le telechargement du modele : il reprendra au prochain demarrage."
+    exit 0
+  fi
   log "Arret demande, fermeture du mineur..."
   if [[ $pid -ne 0 ]]; then
     kill -TERM "$pid" 2>/dev/null
@@ -266,6 +482,9 @@ trap stop TERM INT
 
 [[ -n "$escrow_key" ]] && install_escrow_key
 recover_escrow
+for m in "${wanted_models[@]}"; do
+  fetch_model "$m"
+done
 
 # --- Lancement et relance --------------------------------------------------------
 log "GPU (keryx) : $(show_cmd "${gpu_cmd[@]}")"
