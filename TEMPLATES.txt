@@ -1,0 +1,21 @@
+Template vast.ai pour clusmi/vastkeryx
+======================================
+Image : clusmi/vastkeryx:latest
+Launch mode : Docker ENTRYPOINT  ·  champ des arguments : vide.
+Disque : au moins 50 Go (le modèle IA est téléchargé au premier démarrage ; 30 Go pour
+des RTX 5090).
+
+Remplace IP:PORT par ton nœud et ADRESSE par ton adresse Keryx. Deux façons de saisir :
+dans le champ « Docker Options », la ligne ci-dessous telle quelle (avec -e et les
+guillemets) ; ou dans la section « Environment Variables », une case par variable, avec
+la valeur SANS guillemets.
+
+--- Keryx (GPU) ---
+
+-e GPU_MINER=keryx -e GPU_ARGS="--keryxd-address IP:PORT --mining-address keryx:ADRESSE"
+
+Toute autre option de keryx-miner s'ajoute dans GPU_ARGS, à la suite (--high,
+--force-model ..., --escrow-cert ..., etc.) : elle est passée telle quelle.
+
+Pour vérifier un template sans miner : ajoute -e DRY_RUN=1, la commande complète
+s'affiche dans les logs, puis enlève-le.
