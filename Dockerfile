@@ -1,6 +1,7 @@
 # Image de minage Keryx pour GPU loues sur vast.ai :
 #   GPU_MINER=keryx
 #   GPU_ARGS=<arguments de keryx-miner, passes tels quels>
+#   KERYX_ESCROW_KEY=<facultatif : meme cle escrow sur toutes les instances>
 #
 # La version, l'URL et l'empreinte de keryx-miner sont fournies par le workflow
 # GitHub (scripts/resolve-versions.sh). L'archive est telechargee depuis la
@@ -49,7 +50,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
     RESTART_DELAY=10
 
 LABEL org.opencontainers.image.title="vastkeryx" \
-      org.opencontainers.image.description="keryx-miner (GPU NVIDIA) pour vast.ai ; GPU_MINER=keryx et arguments du mineur dans GPU_ARGS"
+      org.opencontainers.image.description="keryx-miner (GPU NVIDIA) pour vast.ai ; GPU_MINER=keryx, arguments du mineur dans GPU_ARGS, cle escrow commune dans KERYX_ESCROW_KEY"
 
 WORKDIR /opt/miners/work
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

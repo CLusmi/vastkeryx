@@ -3,9 +3,10 @@
 Image Docker pour miner du **Keryx** sur des machines louées sur **vast.ai** (GPU NVIDIA),
 avec le mineur officiel [keryx-miner](https://github.com/Keryx-Labs/keryx-miner).
 
-Deux variables, rien de plus : `GPU_MINER=keryx` et `GPU_ARGS`, qui contient les
+Deux variables obligatoires : `GPU_MINER=keryx` et `GPU_ARGS`, qui contient les
 arguments de keryx-miner **tels quels**, dans sa syntaxe d'origine. L'image n'ajoute
-aucune option.
+aucune option. Une troisième, facultative, `KERYX_ESCROW_KEY`, permet d'utiliser **la
+même clé escrow sur toutes les instances** (voir [plus bas](#clé-escrow-commune)).
 Image publiée : `clusmi/vastkeryx:latest` (publique).
 
 ## Comment l'image est construite
@@ -38,8 +39,9 @@ Pour passer à une nouvelle version du mineur, relance simplement le workflow, p
 |---|---|---|
 | `GPU_MINER` | `keryx` (seule valeur) | |
 | `GPU_ARGS` | | arguments de keryx-miner, tels quels |
+| `KERYX_ESCROW_KEY` | 64 caractères (facultatif) | contenu de ton fichier `escrow.key`, écrit dans le conteneur avant le lancement, jamais affiché |
 | `RESTART_DELAY` | `10` | secondes avant relance du mineur s'il s'arrête |
-| `DRY_RUN` | | `1` : affiche la commande finale sans miner |
+| `DRY_RUN` | | `1` : affiche les commandes finales sans rien lancer ni écrire |
 
 `GPU_MINER` et `GPU_ARGS` sont obligatoires tous les deux : si l'un manque, rien ne
 démarre et le log dit pourquoi.
@@ -52,6 +54,37 @@ valeur, l'image les retire.
 
 Template prêt à copier : voir [TEMPLATES.txt](TEMPLATES.txt).
 
+## Clé escrow commune
+
+En mode nœud (`--keryxd-address IP:PORT`), keryx-miner a besoin d'une clé escrow
+(`escrow.key`) autorisée une fois par ton wallet (`escrow.cert`). Sans rien faire, chaque
+instance neuve créerait sa propre clé, qu'il faudrait autoriser à chaque fois.
+
+Avec `KERYX_ESCROW_KEY`, toutes les instances utilisent **la même clé** :
+
+1. récupère le contenu de `escrow.key` (64 caractères) à côté de ton mineur actuel,
+   et celui de `escrow.cert` (128 caractères) s'il existe ;
+2. dans le template : `KERYX_ESCROW_KEY=<la clé>` et, dans `GPU_ARGS`,
+   `--escrow-cert <le cert>` (option officielle de keryx-miner ; inutile si ton mineur
+   n'a pas de fichier `escrow.cert`, c'est qu'il signe lui-même).
+
+Au démarrage, l'image :
+
+- écrit la clé dans `/opt/miners/work/escrow.key` (droits 600), sans jamais l'afficher ;
+  si ce fichier contenait déjà une **autre** clé (conteneur relancé après un changement de
+  clé), l'ancienne clé et son état sont renommés `*.ancienne-<date>`, jamais effacés ;
+- dans un conteneur neuf (pas encore de `escrow_state.json`), lance une fois
+  `keryx-miner --recover-escrow` : le mineur demande à l'API Keryx les gains en attente
+  sur cette clé, y compris ceux laissés par des instances détruites, puis il les
+  réclame en minant. Si la recherche échoue, le minage démarre quand même. En mode pool
+  (`stratum+tcp://`), il n'y a pas d'escrow : rien de tout ça ne s'applique.
+
+Chaque instance repère tous les gains qui arrivent sur la clé, y compris ceux trouvés par
+les autres : plusieurs instances en même temps tentent donc les mêmes réclamations, une
+seule passe et le mineur écarte les autres. L'hôte vast.ai peut lire les variables du
+conteneur : la clé escrow ne donne accès qu'aux gains en attente de réclamation, pas à
+ton wallet.
+
 ## Ce qu'il faut savoir
 
 - **Machines de 8 cartes** : keryx-miner mine sur toutes les cartes visibles et choisit le
@@ -60,8 +93,8 @@ Template prêt à copier : voir [TEMPLATES.txt](TEMPLATES.txt).
 - **Modèle IA** : il est téléchargé au premier démarrage, une seule fois pour toutes les
   cartes, dans `/opt/miners/keryx/models`. Sur des cartes de 32 Go (RTX 5090), c'est
   Kimi-Linear-48B, soit 30 Go : prévois **au moins 50 Go de disque** sur l'instance.
-- **Fichiers du mineur** (`escrow.key`, `escrow_state.json`…) : ils sont écrits dans le
-  dossier de travail du conteneur, `/opt/miners/work`.
+- **Fichiers du mineur** (`escrow.key`, `escrow.cert`, `escrow_state.json`…) : ils sont
+  écrits dans le dossier de travail du conteneur, `/opt/miners/work`.
 - **Logs** : tout ce qu'écrit keryx-miner apparaît dans les logs de l'instance vast.ai ;
   les lignes de l'image commencent par `[vastkeryx]`.
 - **Relance** : si keryx-miner s'arrête, il est relancé après `RESTART_DELAY` secondes.

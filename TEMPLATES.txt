@@ -5,17 +5,25 @@ Launch mode : Docker ENTRYPOINT  ·  champ des arguments : vide.
 Disque : au moins 50 Go (le modèle IA est téléchargé au premier démarrage ; 30 Go pour
 des RTX 5090).
 
-Remplace IP:PORT par ton nœud et ADRESSE par ton adresse Keryx. Deux façons de saisir :
-dans le champ « Docker Options », la ligne ci-dessous telle quelle (avec -e et les
-guillemets) ; ou dans la section « Environment Variables », une case par variable, avec
-la valeur SANS guillemets.
+Remplace IP:PORT par ton nœud, ADRESSE par ton adresse Keryx, CERT par le contenu de ton
+fichier escrow.cert (128 caractères) et CLE par le contenu de ton fichier escrow.key
+(64 caractères). Deux façons de saisir : dans le champ « Docker Options », la ligne
+ci-dessous telle quelle (avec -e et les guillemets) ; ou dans la section « Environment
+Variables », une case par variable, avec la valeur SANS guillemets.
 
---- Keryx (GPU) ---
+--- Keryx (GPU), même clé escrow sur toutes les instances ---
+
+-e GPU_MINER=keryx -e GPU_ARGS="--keryxd-address IP:PORT --mining-address keryx:ADRESSE --escrow-cert CERT" -e KERYX_ESCROW_KEY=CLE
+
+Pas de fichier escrow.cert à côté de ton mineur actuel ? Alors il signe lui-même :
+enlève simplement --escrow-cert CERT.
+
+--- Keryx (GPU), sans clé commune (chaque instance crée sa propre clé) ---
 
 -e GPU_MINER=keryx -e GPU_ARGS="--keryxd-address IP:PORT --mining-address keryx:ADRESSE"
 
 Toute autre option de keryx-miner s'ajoute dans GPU_ARGS, à la suite (--high,
---force-model ..., --escrow-cert ..., etc.) : elle est passée telle quelle.
+--force-model ..., etc.) : elle est passée telle quelle.
 
-Pour vérifier un template sans miner : ajoute -e DRY_RUN=1, la commande complète
-s'affiche dans les logs, puis enlève-le.
+Pour vérifier un template sans miner : ajoute -e DRY_RUN=1, les commandes complètes
+s'affichent dans les logs (la clé, jamais), puis enlève-le.
