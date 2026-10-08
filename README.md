@@ -107,16 +107,20 @@ mineur, l'image y télécharge le modèle du palier choisi dans `GPU_ARGS`.
 - Les zips de Hugging Face ne sont pas compressés : l'image télécharge seulement la partie
   qui contient `model.gguf`, directement dans `/opt/miners/keryx/models/<modèle>/` (ou le
   dossier de `--models-dir`). Pas de décompression, pas besoin de deux fois la place.
-- Coupure : le téléchargement reprend là où il s'était arrêté (5 essais de suite sans
-  progrès au maximum, puis au prochain démarrage). Moins de 1 Mo/s pendant 60 s : la
-  connexion est relancée.
+- **8 connexions en parallèle** : le fichier est découpé en 8 parts téléchargées en même
+  temps, chacune écrite directement à sa place (une seule connexion plafonne souvent à
+  quelques Mo/s sur les machines louées). Le fichier s'appelle `model.gguf.partial`
+  pendant le téléchargement et devient `model.gguf` une fois complet.
+- Coupure ou erreur : chaque part reprend là où elle s'était arrêtée, avec une pause qui
+  grandit jusqu'à 60 s, sans abandonner. Un arrêt de l'instance perd au plus une minute
+  de téléchargement : il reprend au démarrage suivant.
 - Une ligne de progression toutes les 30 s dans les logs (Go, %, Mo/s).
 - Un modèle déjà présent n'est pas retéléchargé. S'il manque de la place sur le disque,
   le log le dit (taille nécessaire et place restante).
 - **Aucun risque de mauvais modèle** : keryx-miner vérifie lui-même l'empreinte du
-  fichier avec celle inscrite dans son code. Si Hugging Face est injoignable ou que
-  quelque chose ne va pas, keryx-miner télécharge lui-même par IPFS, comme avant (il
-  reprend un fichier partiel).
+  fichier avec celle inscrite dans son code. Si Hugging Face est injoignable au démarrage
+  ou que le zip n'a pas la forme attendue, keryx-miner télécharge lui-même par IPFS,
+  comme avant.
 
 Le palier vient de l'option ; la mémoire de la carte ne fait que le baisser si le modèle
 ne tient pas. Sans option, une RTX 5090 (32 Go) mine donc avec Gemma, le palier par défaut. D'après le README de Keryx, plus le

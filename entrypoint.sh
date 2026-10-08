@@ -330,26 +330,86 @@ parse_zip_head() {
   return 1
 }
 
+# Nombre de connexions paralleles vers Hugging Face pour un modele : chacune
+# telecharge sa part (segment) du fichier. Une seule connexion plafonne souvent a
+# quelques Mo/s sur les machines louees.
+dl_conns=8
+
+# Octets deja ecrits dans le fichier $1 (fichier creux : seuls les blocs ecrits comptent).
+allocated() {
+  local b bs
+  read -r b bs < <(stat -c '%b %B' "$1" 2>/dev/null || echo "0 0")
+  echo $((b * bs))
+}
+
 # Une ligne de progression toutes les 30 s : $1 nom, $2 fichier, $3 taille finale.
 progress_loop() {
   local name="$1" file="$2" total="$3" prev cur t0 t1
-  prev=$(stat -c%s "$file" 2>/dev/null || echo 0)
+  prev=$(allocated "$file")
   t0=$(date +%s)
   while sleep 30; do
-    cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    cur=$(allocated "$file")
+    (( cur > total )) && cur=$total
     t1=$(date +%s)
-    awk -v n="$name" -v c="$cur" -v T="$total" -v p="$prev" -v dt=$((t1 - t0)) 'BEGIN {
+    awk -v n="$name" -v c="$cur" -v T="$total" -v p="$prev" -v dt=$((t1 - t0)) -v k="$dl_conns" 'BEGIN {
       if (dt < 1) dt = 1
-      printf "[vastkeryx] Modele %s : %.1f / %.1f Go (%d %%), %.0f Mo/s\n", n, c / 1e9, T / 1e9, 100 * c / T, (c - p) / 1e6 / dt }'
+      printf "[vastkeryx] Modele %s : %.1f / %.1f Go (%d %%), %.0f Mo/s (%d connexions)\n", n, c / 1e9, T / 1e9, 100 * c / T, (c - p) / 1e6 / dt, k }'
     prev=$cur
     t0=$t1
   done
 }
 
-# Telecharge le modele $1 (nom du zip). Vrai si model.gguf est complet a la fin ;
-# sinon keryx-miner reprendra lui-meme (il continue un fichier partiel).
+# Telecharge le segment $1 de model.gguf dans le fichier partiel, a sa place.
+# Avancement du segment : fichier <partiel>.seg<N> (octets ecrits et confirmes).
+# Chaque essai dure au plus 60 s (l'avancement est enregistre a chaque fin d'essai :
+# un arret du conteneur perd au plus une minute) ; moins de 100 Ko/s pendant 30 s :
+# on coupe et on reprend. Pas d'abandon : en cas
+# d'erreur, nouvel essai apres une pause qui grandit jusqu'a 60 s.
+seg_worker() {
+  local i="$1" s="${seg_s[$1]}" len="${seg_l[$1]}" st="$part.seg$1" errf done rem http got fails=0 wait_s
+  local -a codes
+  errf=$(mktemp)
+  while :; do
+    done=$(cat "$st" 2>/dev/null || echo 0)
+    [[ "$done" =~ ^[0-9]+$ ]] || done=0
+    (( done >= len )) && break
+    rem=$((len - done))
+    # --max-filesize : une reponse entiere (plage ignoree) est refusee avant d'ecrire ;
+    # head -c : jamais plus que la taille du segment.
+    curl -fsSL --connect-timeout 30 --max-time 60 --speed-limit 102400 --speed-time 30 \
+         --max-filesize "$rem" -r "$((zip_start + s + done))-$((zip_start + s + len - 1))" \
+         -w '%{stderr}\n%{http_code} %{size_download}\n' "$url" 2> "$errf" \
+      | head -c "$rem" \
+      | dd of="$part" bs=1M seek=$((s + done)) oflag=seek_bytes conv=notrunc status=none
+    codes=("${PIPESTATUS[@]}")
+    read -r http got < <(tail -n 1 "$errf")
+    [[ "$got" =~ ^[0-9]+$ ]] || got=0
+    (( got > rem )) && got=$rem
+    if [[ "$http" == 206 && ${codes[2]} -eq 0 ]] && (( got > 0 )); then
+      echo $((done + got)) > "$st.tmp" && mv -f "$st.tmp" "$st"
+      fails=0
+    else
+      fails=$((fails + 1))
+      wait_s=$((fails * 5))
+      (( wait_s > 60 )) && wait_s=60
+      if [[ ${codes[2]} -ne 0 ]]; then
+        log "Modele $name : segment $((i + 1))/$dl_conns : ecriture impossible (disque plein ?) ; nouvel essai dans ${wait_s} s."
+      else
+        log "Modele $name : segment $((i + 1))/$dl_conns : erreur (curl code ${codes[0]}, HTTP ${http:-?}) ; nouvel essai dans ${wait_s} s."
+      fi
+      sleep "$wait_s"
+    fi
+  done
+  rm -f "$errf"
+}
+
+# Telecharge le modele $1 (nom du zip) depuis Hugging Face, en $dl_conns connexions.
+# Les segments sont ecrits a leur place dans model.gguf.partial, renomme en
+# model.gguf une fois complet : keryx-miner ne voit jamais de fichier a moitie fait.
+# Vrai si model.gguf est complet a la fin.
 fetch_model() {
-  local name="$1" url="$models_url/$1.zip" hdrf errf dir dest have before avail http rc fails=0 t0 prog
+  local name="$1" url="$models_url/$1.zip" hdrf dir dest part layout want have prefix avail t0 have0 prog i s l c
+  local -a wpids=()
   if [[ -f "$models_root/$name/.ok" && -f "$models_root/$name/model.gguf" ]]; then
     log "Modele $name : deja present et verifie par keryx-miner."
     return 0
@@ -371,66 +431,104 @@ fetch_model() {
 
   dir="$models_root/$zip_folder"
   dest="$dir/model.gguf"
+  part="$dest.partial"
+  layout="$part.layout"
   mkdir -p "$dir" || { log "Modele $name : impossible de creer $dir."; return 1; }
+  if [[ -f "$dest" ]]; then
+    have=$(stat -c%s "$dest")
+    if (( have == zip_size )); then
+      log "Modele $name : deja telecharge ($(gb "$zip_size") Go)."
+      return 0
+    fi
+    (( have > zip_size )) && rm -f "$dest"
+  fi
+
+  # Segments : $dl_conns parts egales de model.gguf (positions dans le fichier final).
+  seg_s=()
+  seg_l=()
+  l=$(( (zip_size + dl_conns - 1) / dl_conns ))
+  for ((i = 0; i < dl_conns; i++)); do
+    s=$((i * l))
+    c=$((zip_size - s))
+    (( c > l )) && c=$l
+    (( c < 0 )) && c=0
+    seg_s+=("$s")
+    seg_l+=("$c")
+  done
+
+  # Un telechargement partiel d'une autre forme (autre version du modele, autre
+  # decoupage) est jete ; un model.gguf partiel (ancienne version de l'image, ou
+  # keryx-miner) est repris comme debut du fichier.
+  want="$zip_size $zip_start $dl_conns"
+  if [[ -f "$part" ]] && [[ "$(cat "$layout" 2>/dev/null)" != "$want" || $(stat -c%s "$part") -ne $zip_size ]]; then
+    rm -f "$part" "$part".seg* "$layout"
+    log "Modele $name : ancien telechargement partiel incompatible, efface."
+  fi
+  if [[ ! -f "$part" ]]; then
+    prefix=0
+    if [[ -f "$dest" ]]; then
+      prefix=$(stat -c%s "$dest")
+      mv -f -- "$dest" "$part" || return 1
+    fi
+    truncate -s "$zip_size" "$part" || { log "Modele $name : impossible de creer $part."; return 1; }
+    for ((i = 0; i < dl_conns; i++)); do
+      c=$((prefix - seg_s[i]))
+      (( c < 0 )) && c=0
+      (( c > seg_l[i] )) && c=${seg_l[i]}
+      echo "$c" > "$part.seg$i"
+    done
+    echo "$want" > "$layout"
+  fi
+
   have=0
-  [[ -f "$dest" ]] && have=$(stat -c%s "$dest")
-  if (( have == zip_size )); then
-    log "Modele $name : deja telecharge ($(gb "$zip_size") Go)."
-    return 0
-  fi
-  if (( have > zip_size )); then
-    rm -f "$dest"
-    have=0
-  fi
+  for ((i = 0; i < dl_conns; i++)); do
+    c=$(cat "$part.seg$i" 2>/dev/null || echo 0)
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    have=$((have + c))
+  done
   avail=$(df -PB1 "$dir" | awk 'NR == 2 { print $4 }')
   if (( avail < zip_size - have + 1000000000 )); then
     log "Modele $name : ERREUR, disque insuffisant : il faut $(gb $((zip_size - have))) Go (+1 Go de marge), il reste $(gb "$avail") Go. Prends plus de disque sur l'instance."
     return 1
   fi
   if (( have > 0 )); then
-    log "Modele $name : reprise a $(gb "$have") / $(gb "$zip_size") Go depuis Hugging Face..."
+    log "Modele $name : reprise a $(gb "$have") / $(gb "$zip_size") Go depuis Hugging Face ($dl_conns connexions)..."
   else
-    log "Modele $name : telechargement de $(gb "$zip_size") Go depuis Hugging Face vers $dest..."
+    log "Modele $name : telechargement de $(gb "$zip_size") Go depuis Hugging Face vers $dest ($dl_conns connexions)..."
   fi
 
-  errf=$(mktemp)
   t0=$(date +%s)
+  have0=$have
   phase=download
-  progress_loop "$name" "$dest" "$zip_size" &
+  progress_loop "$name" "$part" "$zip_size" &
   prog=$!
-  # Plage exacte de model.gguf dans le zip, ajoutee a la suite du fichier. Une reponse
-  # autre que 206 (plage ignoree) est annulee. Moins de 1 Mo/s pendant 60 s : on
-  # coupe et on reprend. Abandon apres 5 essais de suite sans progres.
-  while (( have < zip_size && fails < 5 )); do
-    before=$have
-    curl -fsSL --connect-timeout 30 --speed-limit 1048576 --speed-time 60 \
-         -r "$((zip_start + have))-$((zip_start + zip_size - 1))" \
-         -w '%{stderr}%{http_code}\n' "$url" >> "$dest" 2> "$errf" &
-    pid=$!
-    wait "$pid"
-    rc=$?
-    pid=0
-    http=$(tail -n 1 "$errf")
-    if [[ "$http" != 206 ]]; then
-      truncate -s "$before" "$dest"
-    fi
-    have=$(stat -c%s "$dest")
-    if (( have > before )); then fails=0; else fails=$((fails + 1)); fi
-    if (( have < zip_size )); then
-      log "Modele $name : coupure a $(gb "$have") Go (curl code $rc, HTTP ${http:-?}) ; reprise dans 5 s."
-      sleep 5 & wait $!
-    fi
+  for ((i = 0; i < dl_conns; i++)); do
+    seg_worker "$i" &
+    wpids+=($!)
+  done
+  for i in "${wpids[@]}"; do
+    wait "$i"
   done
   kill "$prog" 2>/dev/null
   wait "$prog" 2>/dev/null
   phase=""
-  rm -f "$errf"
-  if (( have == zip_size )); then
-    log "Modele $name : telecharge en $(( ($(date +%s) - t0) / 60 )) min ; keryx-miner va verifier son empreinte."
-    return 0
+
+  have=0
+  for ((i = 0; i < dl_conns; i++)); do
+    c=$(cat "$part.seg$i" 2>/dev/null || echo 0)
+    have=$((have + c))
+  done
+  if (( have != zip_size )) || [[ "$(head -c 4 "$part")" != GGUF ]]; then
+    log "Modele $name : fichier incoherent apres telechargement ; efface, keryx-miner le telechargera lui-meme (IPFS)."
+    rm -f "$part" "$part".seg* "$layout"
+    return 1
   fi
-  log "Modele $name : echec apres plusieurs essais ($(gb "$have") / $(gb "$zip_size") Go) ; keryx-miner continuera le telechargement lui-meme (IPFS)."
-  return 1
+  mv -f -- "$part" "$dest" && rm -f "$part".seg* "$layout"
+  t0=$(( $(date +%s) - t0 ))
+  awk -v n="$name" -v b=$((zip_size - have0)) -v t="$t0" 'BEGIN {
+    if (t < 1) t = 1
+    printf "[vastkeryx] Modele %s : telecharge en %d min %02d s (%.0f Mo/s en moyenne) ; keryx-miner va verifier son empreinte.\n", n, t / 60, t % 60, b / 1e6 / t }'
+  return 0
 }
 
 if [[ $dry_run -eq 1 ]]; then
