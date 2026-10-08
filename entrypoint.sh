@@ -531,7 +531,101 @@ fetch_model() {
   return 0
 }
 
+# --- Test de connexion au noeud ou a la pool (informatif) -------------------------
+# Avant le telechargement : la cible de keryx-miner repond-elle, et en combien de
+# temps ? (a 10 blocs par seconde, plus le noeud est loin, plus des blocs arrivent
+# trop tard). Le resultat est seulement affiche : la suite demarre quoi qu'il arrive.
+ms_now() { date +%s%3N; }
+
+check_connection() {
+  local target hp host port port_opt def_port kind urlhost t0 rc tcp_ms req resp hdrs out http ttfb ms ver gst gmsg line
+  target="${node:-127.0.0.1}"
+  port_opt=$(opt_value "--port|-p" "${gpu_user[@]}")
+  if has_opt --testnet "${gpu_user[@]}"; then def_port=22210; else def_port=22110; fi
+  case "$target" in
+    stratum+tcp://*) kind=pool; hp="${target#stratum+tcp://}" ;;
+    grpc://*)        kind=node; hp="${target#grpc://}" ;;
+    *://*)           log "Connexion : adresse $target non reconnue (ni grpc:// ni stratum+tcp://), pas de test."; return 0 ;;
+    *)               kind=node; hp="$target" ;;
+  esac
+  hp="${hp%%/*}"
+  if [[ "$hp" == *:* ]]; then
+    host="${hp%:*}"
+    port="${hp##*:}"
+  else
+    host="$hp"
+    port="${port_opt:-$def_port}"
+  fi
+  host="${host#[}"
+  host="${host%]}"
+  urlhost="$host"
+  [[ "$host" == *:* ]] && urlhost="[$host]"
+  local what="noeud" the="le noeud"
+  [[ $kind == pool ]] && what="pool" the="la pool"
+
+  # 1. Connexion TCP (environ un aller-retour reseau).
+  t0=$(ms_now)
+  timeout 10 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if [[ $rc -eq 124 ]]; then
+      log "Connexion : ERREUR, $the $host:$port ne repond pas (rien en 10 s). Verifie l'adresse dans GPU_ARGS et que $the est en marche. Le demarrage continue quand meme."
+    else
+      log "Connexion : ERREUR, impossible de joindre $the $host:$port (connexion refusee ou adresse introuvable). Verifie l'adresse et le port dans GPU_ARGS. Le demarrage continue quand meme."
+    fi
+    return 0
+  fi
+  tcp_ms=$(( $(ms_now) - t0 ))
+  log "Connexion : $what $host:$port joignable (connexion en $tcp_ms ms)."
+
+  if [[ $kind == node ]]; then
+    # 2. Requete GetInfo en gRPC, comme keryx-miner : KaspadMessage { getInfoRequest (1063) }.
+    req=$(mktemp); resp=$(mktemp); hdrs=$(mktemp)
+    printf '\x00\x00\x00\x00\x03\xba\x42\x00' > "$req"
+    out=$(curl -sS --http2-prior-knowledge --max-time 10 -X POST \
+            -H 'content-type: application/grpc' -H 'te: trailers' \
+            --data-binary @"$req" -D "$hdrs" -o "$resp" -w '%{http_code} %{time_starttransfer}' \
+            "http://$urlhost:$port/protowire.RPC/MessageStream" 2>/dev/null)
+    read -r http ttfb <<< "$out"
+    ms=$(awk -v t="${ttfb:-0}" 'BEGIN { printf "%d", t * 1000 }')
+    gst=$(tr -d '\r' < "$hdrs" | awk -F': *' 'tolower($1) == "grpc-status" { print $2 }' | tail -n 1)
+    gmsg=$(tr -d '\r' < "$hdrs" | awk -F': *' 'tolower($1) == "grpc-message" { print $2 }' | tail -n 1)
+    if [[ "$http" == 200 && $(stat -c%s "$resp") -gt 5 ]]; then
+      ver=$(grep -aoE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z._-]*' "$resp" | head -n 1)
+      log "Connexion : le noeud repond a GetInfo en $ms ms${ver:+ (version $ver)}."
+    elif [[ "$http" == 200 && "$gst" == 12 ]]; then
+      log "Connexion : ATTENTION, le port $port parle gRPC mais ne connait pas les requetes RPC : est-ce bien le port RPC du noeud (pas le port P2P) ?"
+    elif [[ "$http" == 200 ]]; then
+      log "Connexion : ATTENTION, le noeud accepte la connexion gRPC mais n'a pas repondu a GetInfo en 10 s${gst:+ (grpc-status $gst${gmsg:+ : $gmsg})} : noeud surcharge ou en cours de synchronisation ?"
+    else
+      log "Connexion : ATTENTION, le port $port repond mais pas comme un noeud gRPC (HTTP ${http:-?}) : verifie que c'est le port RPC du noeud."
+    fi
+    rm -f "$req" "$resp" "$hdrs"
+  else
+    # 2. Demande d'abonnement stratum : une pool repond par une ligne JSON.
+    out=$(timeout 15 bash -c '
+      exec 3<>"/dev/tcp/$1/$2" || exit 2
+      t0=$(date +%s%3N)
+      printf "%s\n" "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"vastkeryx-test\"]}" >&3
+      IFS= read -r -t 10 line <&3 || exit 3
+      echo "$(( $(date +%s%3N) - t0 )) $line"
+    ' _ "$host" "$port" 2>/dev/null)
+    ms="${out%% *}"
+    line="${out#* }"
+    line="${line#"${line%%[![:space:]]*}"}"
+    # Une vraie reponse stratum est une ligne JSON ({"id":1,...}) ; un serveur web,
+    # lui, repond par une ligne « HTTP/1.x ... » qui peut recopier la requete.
+    if [[ "$ms" =~ ^[0-9]+$ && "$line" == '{'* && "$line" == *'"id"'* ]]; then
+      log "Connexion : la pool repond (stratum) en $ms ms."
+    else
+      log "Connexion : ATTENTION, le port $port est ouvert mais ne repond pas comme une pool stratum (rien de lisible en 10 s)."
+    fi
+  fi
+  return 0
+}
+
 if [[ $dry_run -eq 1 ]]; then
+  check_connection
   log "Modele(s) pour ce palier (${wanted_tiers[*]}) : ${wanted_models[*]} -> $models_root (depuis Hugging Face)"
   if [[ -n "$escrow_key" ]]; then
     log "Escrow : KERYX_ESCROW_KEY valide, serait ecrite dans $key_file (DRY_RUN : rien n'est ecrit)."
@@ -578,6 +672,7 @@ stop() {
 }
 trap stop TERM INT
 
+check_connection
 [[ -n "$escrow_key" ]] && install_escrow_key
 recover_escrow
 for m in "${wanted_models[@]}"; do

@@ -88,6 +88,26 @@ seule passe et le mineur écarte les autres. L'hôte vast.ai peut lire les varia
 conteneur : la clé escrow ne donne accès qu'aux gains en attente de réclamation, pas à
 ton wallet.
 
+## Test de connexion au démarrage
+
+Avant le téléchargement du modèle, l'image vérifie que le nœud ou la pool de `GPU_ARGS`
+répond, et l'écrit dans le log (lignes `Connexion :`). C'est seulement informatif : la
+suite démarre quoi qu'il arrive.
+
+- **Nœud** (`--keryxd-address IP:PORT`, `grpc://…` ou `-s IP`) : connexion au port, puis
+  une vraie requête *GetInfo* en gRPC, comme le fait keryx-miner. Exemple :
+  `noeud 212.114.16.76:1202 joignable (connexion en 85 ms)` puis
+  `le noeud repond a GetInfo en 90 ms (version 1.3.0-OPoI)`.
+- **Pool** (`stratum+tcp://…`) : connexion, puis une demande d'abonnement stratum
+  (`mining.subscribe`).
+- En cas de problème, le log dit lequel : port fermé ou adresse introuvable, rien en 10 s,
+  port qui ne parle pas gRPC, port P2P du nœud au lieu du port RPC, nœud qui ne répond
+  pas à *GetInfo*.
+
+Le temps de connexion donne une idée de la distance entre la machine vast.ai et ton
+nœud : à environ 10 blocs par seconde, plus il est grand, plus des blocs risquent
+d'arriver trop tard. Avec `DRY_RUN=1`, le test se fait aussi, sans rien télécharger.
+
 ## Modèle IA : téléchargement rapide
 
 keryx-miner télécharge son modèle depuis la passerelle IPFS de Keryx, souvent très lente,
