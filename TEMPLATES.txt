@@ -7,8 +7,8 @@ Disque : la taille du modèle IA plus de la marge, par exemple au moins 40 Go av
 Le modèle est téléchargé au démarrage depuis Hugging Face (voir README).
 
 Remplace IP:PORT par ton nœud, ADRESSE par ton adresse Keryx, CERT par le contenu de ton
-fichier escrow.cert (128 caractères) et CLE par le contenu de ton fichier escrow.key
-(64 caractères). Deux façons de saisir : dans le champ « Docker Options », la ligne
+fichier escrow.cert (128 caractères), CLE par le contenu de ton fichier escrow.key
+(64 caractères) et ADRESSE_MONERO par ton adresse Monero. Deux façons de saisir : dans le champ « Docker Options », la ligne
 ci-dessous telle quelle (avec -e et les guillemets) ; ou dans la section « Environment
 Variables », une case par variable, avec la valeur SANS guillemets.
 
@@ -21,6 +21,20 @@ Sans --very-high : palier par défaut (Gemma). Autres paliers : --very-light, --
 
 Pas de fichier escrow.cert à côté de ton mineur actuel ? Alors il signe lui-même :
 enlève simplement --escrow-cert CERT.
+
+--- Keryx (GPU) + Monero (CPU, XMRig) ---
+
+-e GPU_MINER=keryx -e GPU_ARGS="--keryxd-address IP:PORT --mining-address keryx:ADRESSE --escrow-cert CERT --very-high" -e KERYX_ESCROW_KEY=CLE -e CPU_MINER=xmrig -e CPU_ARGS="--coin monero -o xmr.kryptex.network:7029 -u ADRESSE_MONERO/RENT -k"
+
+Pas besoin de -t : l'image met le nombre de cœurs alloués à l'instance (affiché dans le
+log). XMRig tourne en priorité basse : keryx-miner passe toujours avant lui. Il démarre
+tout de suite, donc il mine aussi pendant le téléchargement du modèle.
+
+--- Monero seul (CPU, XMRig) ---
+
+-e CPU_MINER=xmrig -e CPU_ARGS="--coin monero -o xmr.kryptex.network:7029 -u ADRESSE_MONERO/RENT -k"
+
+Règle : un côté démarre seulement si son MINER et ses ARGS sont renseignés tous les deux.
 
 --- Keryx (GPU), sans clé commune (chaque instance crée sa propre clé) ---
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Lance keryx-miner sur les GPU NVIDIA. Les arguments de GPU_ARGS sont passes
-# au mineur tels quels : l'image n'ajoute aucune option.
+# Lance keryx-miner sur les GPU NVIDIA et/ou XMRig sur le CPU. Les arguments de
+# GPU_ARGS sont passes a keryx-miner tels quels : l'image n'y ajoute aucune option.
+# Un cote demarre seulement si SON mineur ET SES arguments sont renseignes.
 #
 # Variables :
 #   GPU_MINER         keryx (seule valeur possible)
@@ -9,8 +10,17 @@
 #   KERYX_ESCROW_KEY  facultatif : les 64 caracteres du fichier escrow.key, pour
 #                     utiliser la meme cle escrow sur toutes les instances. Elle est
 #                     ecrite dans escrow.key avant le lancement, jamais affichee.
-#   RESTART_DELAY     secondes avant relance du mineur s'il s'arrete (defaut 10)
+#   CPU_MINER         xmrig (seule valeur possible)
+#   CPU_ARGS          arguments de XMRig
+#                     ex. --coin monero -o xmr.kryptex.network:7029 -u ADRESSE/RENT -k
+#   RESTART_DELAY     secondes avant relance d'un mineur qui s'arrete (defaut 10)
 #   DRY_RUN=1         affiche les commandes finales sans rien lancer ni ecrire
+#
+# XMRig : ajoutes automatiquement, sauf s'ils sont deja dans CPU_ARGS :
+# --randomx-no-numa, --no-color, et -t <coeurs alloues a l'instance> (sans -t,
+# --threads, --cpu-max-threads-hint ni fichier de config). Il tourne en priorite
+# la plus basse (nice 19) : keryx-miner passe toujours avant lui. Il demarre tout
+# de suite, et mine donc pendant le telechargement du modele.
 #
 # Au demarrage d'un conteneur neuf (aucun escrow_state.json), en mode noeud, la
 # cle etant presente : keryx-miner --recover-escrow est lance une fois pour
@@ -26,6 +36,7 @@ set -uo pipefail
 
 MINERS_DIR=/opt/miners
 keryx="$MINERS_DIR/keryx/keryx-miner"
+xmrig="$MINERS_DIR/xmrig/xmrig"
 
 log() { echo "[vastkeryx] $*"; }
 die() { echo "[vastkeryx] ERREUR: $*" >&2; exit 1; }
@@ -43,7 +54,7 @@ log "Version installee : $(tr '\n' ' ' < "$MINERS_DIR/VERSIONS")"
 # Seuls les noms sont affiches, jamais les valeurs (la cle escrow est secrete).
 present=()
 absent=()
-for name in GPU_MINER GPU_ARGS KERYX_ESCROW_KEY; do
+for name in GPU_MINER GPU_ARGS KERYX_ESCROW_KEY CPU_MINER CPU_ARGS; do
   if [[ -n "${!name:-}" ]]; then present+=("$name"); else absent+=("$name"); fi
 done
 log "Variables recues : ${present[*]:-aucune}${absent[*]:+ ; absentes : ${absent[*]}}"
@@ -113,30 +124,97 @@ valid_privkey() {
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] && [[ "$key" != "$(printf '%064d' 0)" ]] && [[ "$key" < "$order" ]]
 }
 
-# --- Verifications ---------------------------------------------------------------
-if [[ -z "${GPU_MINER:-}" && -z "${GPU_ARGS:-}" ]]; then
-  die "rien a miner : renseigne GPU_MINER=keryx et GPU_ARGS (arguments de keryx-miner)."
-elif [[ -z "${GPU_ARGS:-}" ]]; then
-  die "GPU_MINER est renseigne mais GPU_ARGS manque (ou vide)."
-elif [[ -z "${GPU_MINER:-}" ]]; then
-  die "GPU_ARGS est renseigne mais GPU_MINER manque (GPU_MINER=keryx)."
-fi
+# Coeurs CPU alloues a l'instance : le plus petit entre les coeurs visibles (nproc)
+# et le quota CPU du conteneur (cgroup), au moins 1.
+allotted_cpus() {
+  local n q="" p=""
+  n=$(nproc 2>/dev/null || echo 1)
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r q p < /sys/fs/cgroup/cpu.max
+  elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+  fi
+  if [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] && (( p > 0 && q > 0 )); then
+    q=$((q / p))
+    (( q < 1 )) && q=1
+    (( q < n )) && n=$q
+  fi
+  echo "$n"
+}
 
-case "$(lower "$GPU_MINER")" in
-  keryx|keryx-miner) ;;
-  *) die "GPU_MINER=${GPU_MINER} inconnu. Seule valeur possible : keryx." ;;
-esac
-[[ -x "$keryx" ]] || die "binaire introuvable : $keryx"
+# --- Qu'est-ce qui doit tourner ? -----------------------------------------------
+# Un cote est actif seulement si son mineur ET ses arguments sont renseignes.
+# Une variable seule est refusee : rien ne demarre sans choix explicite.
+gpu_on=0
+cpu_on=0
+if [[ -n "${GPU_MINER:-}" && -n "${GPU_ARGS:-}" ]]; then gpu_on=1
+elif [[ -n "${GPU_MINER:-}" ]]; then die "GPU_MINER est renseigne mais GPU_ARGS manque (ou vide)."
+elif [[ -n "${GPU_ARGS:-}" ]]; then die "GPU_ARGS est renseigne mais GPU_MINER manque (GPU_MINER=keryx)."
+fi
+if [[ -n "${CPU_MINER:-}" && -n "${CPU_ARGS:-}" ]]; then cpu_on=1
+elif [[ -n "${CPU_MINER:-}" ]]; then die "CPU_MINER est renseigne mais CPU_ARGS manque (ou vide)."
+elif [[ -n "${CPU_ARGS:-}" ]]; then die "CPU_ARGS est renseigne mais CPU_MINER manque (CPU_MINER=xmrig)."
+fi
+if (( gpu_on == 0 && cpu_on == 0 )); then
+  die "rien a miner : renseigne GPU_MINER=keryx + GPU_ARGS (GPU), CPU_MINER=xmrig + CPU_ARGS (CPU), ou les deux."
+fi
 
 delay="${RESTART_DELAY:-10}"
 [[ "$delay" =~ ^[0-9]+$ ]] || die "RESTART_DELAY=${delay} : nombre de secondes attendu."
 
-split_args "$GPU_ARGS" gpu_user
-[[ ${#gpu_user[@]} -gt 0 ]] || die "GPU_ARGS ne contient aucun argument."
-if has_opt --recover-escrow "${gpu_user[@]}"; then
-  die "retire --recover-escrow de GPU_ARGS : le mineur s'arreterait apres la recuperation. L'image la fait elle-meme au demarrage."
+# --- GPU : keryx-miner ---------------------------------------------------------
+gpu_user=()
+gpu_cmd=()
+if (( gpu_on )); then
+  case "$(lower "$GPU_MINER")" in
+    keryx|keryx-miner) ;;
+    *) die "GPU_MINER=${GPU_MINER} inconnu. Seule valeur possible : keryx." ;;
+  esac
+  [[ -x "$keryx" ]] || die "binaire introuvable : $keryx"
+  split_args "$GPU_ARGS" gpu_user
+  [[ ${#gpu_user[@]} -gt 0 ]] || die "GPU_ARGS ne contient aucun argument."
+  if has_opt --recover-escrow "${gpu_user[@]}"; then
+    die "retire --recover-escrow de GPU_ARGS : le mineur s'arreterait apres la recuperation. L'image la fait elle-meme au demarrage."
+  fi
+  gpu_cmd=("$keryx" "${gpu_user[@]}")
 fi
-gpu_cmd=("$keryx" "${gpu_user[@]}")
+
+# --- CPU : XMRig ---------------------------------------------------------------
+cpu_user=()
+cpu_cmd=()
+cpu_threads_note=""
+if (( cpu_on )); then
+  case "$(lower "$CPU_MINER")" in
+    xmrig) ;;
+    *) die "CPU_MINER=${CPU_MINER} inconnu. Seule valeur possible : xmrig." ;;
+  esac
+  [[ -x "$xmrig" ]] || die "binaire introuvable : $xmrig"
+  split_args "$CPU_ARGS" cpu_user
+  [[ ${#cpu_user[@]} -gt 0 ]] || die "CPU_ARGS ne contient aucun argument."
+  # Priorite la plus basse : keryx-miner (preuves de blocs, requetes IA) passe avant.
+  cpu_cmd=(nice -n 19 "$xmrig")
+  # --randomx-no-numa : dans un conteneur, XMRig ne peut pas placer sa memoire par
+  # processeur ; sans cette option il passe en mode lent sur les machines a
+  # plusieurs processeurs (environ 10 fois moins de hashrate).
+  has_opt --randomx-no-numa "${cpu_user[@]}" || cpu_cmd+=(--randomx-no-numa)
+  has_opt --no-color "${cpu_user[@]}"        || cpu_cmd+=(--no-color)
+  # Nombre de threads : celui de CPU_ARGS s'il y en a un, sinon les coeurs alloues
+  # a l'instance (XMRig, lui, compterait tous les coeurs de la machine hote).
+  cpu_threads_set=0
+  for a in "${cpu_user[@]}"; do
+    [[ "$a" =~ ^-t[0-9]+$ ]] && cpu_threads_set=1
+  done
+  for o in -t --threads --cpu-max-threads-hint -c --config; do
+    has_opt "$o" "${cpu_user[@]}" && cpu_threads_set=1
+  done
+  if (( cpu_threads_set == 0 )); then
+    n=$(allotted_cpus)
+    cpu_cmd+=(-t "$n")
+    cpu_threads_note="$n coeurs alloues a l'instance : -t $n ajoute automatiquement"
+  fi
+  cpu_cmd+=("${cpu_user[@]}")
+fi
 
 dry_run=0
 [[ "${DRY_RUN:-0}" == 1 ]] && dry_run=1
@@ -625,53 +703,107 @@ check_connection() {
 }
 
 if [[ $dry_run -eq 1 ]]; then
-  check_connection
-  log "Modele(s) pour ce palier (${wanted_tiers[*]}) : ${wanted_models[*]} -> $models_root (depuis Hugging Face)"
-  if [[ -n "$escrow_key" ]]; then
-    log "Escrow : KERYX_ESCROW_KEY valide, serait ecrite dans $key_file (DRY_RUN : rien n'est ecrit)."
+  if (( cpu_on )); then
+    [[ -n "$cpu_threads_note" ]] && log "CPU : $cpu_threads_note."
+    log "CPU (xmrig, priorite basse) : $(show_cmd "${cpu_cmd[@]}")"
   else
-    log "Escrow : KERYX_ESCROW_KEY absente, keryx-miner utilise ou cree $key_file."
+    log "CPU : desactive (CPU_MINER et CPU_ARGS vides)."
   fi
-  if [[ $pool_mode -eq 1 ]]; then
-    log "Escrow : mode pool (stratum), pas de recuperation."
-  elif [[ -z "$escrow_key" && ! -f "$key_file" ]]; then
-    log "Escrow : pas de recuperation (pas encore de cle)."
+  if (( gpu_on )); then
+    check_connection
+    log "Modele(s) pour ce palier (${wanted_tiers[*]}) : ${wanted_models[*]} -> $models_root (depuis Hugging Face)"
+    if [[ -n "$escrow_key" ]]; then
+      log "Escrow : KERYX_ESCROW_KEY valide, serait ecrite dans $key_file (DRY_RUN : rien n'est ecrit)."
+    else
+      log "Escrow : KERYX_ESCROW_KEY absente, keryx-miner utilise ou cree $key_file."
+    fi
+    if [[ $pool_mode -eq 1 ]]; then
+      log "Escrow : mode pool (stratum), pas de recuperation."
+    elif [[ -z "$escrow_key" && ! -f "$key_file" ]]; then
+      log "Escrow : pas de recuperation (pas encore de cle)."
+    else
+      log "Escrow : recuperation (conteneur neuf) : $(show_cmd "${recover_cmd[@]}")"
+    fi
+    log "GPU (keryx) : $(show_cmd "${gpu_cmd[@]}")"
   else
-    log "Escrow : recuperation (conteneur neuf) : $(show_cmd "${recover_cmd[@]}")"
+    log "GPU : desactive (GPU_MINER et GPU_ARGS vides)."
   fi
-  log "GPU (keryx) : $(show_cmd "${gpu_cmd[@]}")"
   exit 0
 fi
 
-if ! ls /dev/nvidia* >/dev/null 2>&1 && [[ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]]; then
+if (( gpu_on )) && ! ls /dev/nvidia* >/dev/null 2>&1 && [[ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]]; then
   log "ATTENTION : aucun GPU NVIDIA visible dans le conteneur (lancer avec --gpus all)."
 fi
 
-# Un arret du conteneur est transmis au mineur (SIGTERM), qui a le temps
+# --- Arret -----------------------------------------------------------------------
+# Un arret du conteneur est transmis aux mineurs (SIGTERM) ; keryx-miner a le temps
 # d'enregistrer son etat avant de quitter.
 pid=0
 phase=""
+cpu_sup=0
 stop() {
+  # XMRig d'abord : sa boucle lui transmet l'arret.
+  (( cpu_sup )) && kill -TERM "$cpu_sup" 2>/dev/null
   # Pendant la recuperation, rien n'est encore ecrit (le mineur enregistre l'etat
   # d'un coup, a la fin) : on quitte sans attendre la reponse de l'API.
   if [[ "$phase" == recover ]]; then
     log "Arret demande pendant la recuperation escrow : abandonnee."
+    (( cpu_sup )) && wait "$cpu_sup" 2>/dev/null
     exit 0
   fi
   # Pendant le telechargement du modele : le fichier partiel reste, il sera repris.
   if [[ "$phase" == download ]]; then
     log "Arret demande pendant le telechargement du modele : il reprendra au prochain demarrage."
+    (( cpu_sup )) && wait "$cpu_sup" 2>/dev/null
     exit 0
   fi
-  log "Arret demande, fermeture du mineur..."
+  log "Arret demande, fermeture des mineurs..."
   if [[ $pid -ne 0 ]]; then
     kill -TERM "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
   fi
+  (( cpu_sup )) && wait "$cpu_sup" 2>/dev/null
   exit 0
 }
 trap stop TERM INT
 
+# --- CPU : XMRig, tout de suite et dans sa propre boucle -----------------------
+# Lignes prefixees [cpu] ; relance apres RESTART_DELAY s'il s'arrete, sans toucher
+# a keryx-miner. Il mine aussi pendant la preparation du GPU (modele, escrow).
+cpu_supervisor() {
+  local cpid=0 code
+  trap 'if (( cpid )); then kill -TERM "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; fi; exit 0' TERM
+  trap '' INT
+  while :; do
+    "${cpu_cmd[@]}" > >(sed -u 's/^/[cpu] /') 2>&1 &
+    cpid=$!
+    wait "$cpid"
+    code=$?
+    cpid=0
+    log "CPU : XMRig s'est arrete (code $code). Relance dans ${delay}s."
+    sleep "$delay" & wait $!
+  done
+}
+
+if (( cpu_on )); then
+  [[ -n "$cpu_threads_note" ]] && log "CPU : $cpu_threads_note."
+  log "CPU (xmrig, priorite basse) : $(show_cmd "${cpu_cmd[@]}")"
+  cpu_supervisor &
+  cpu_sup=$!
+else
+  log "CPU : desactive (CPU_MINER et CPU_ARGS vides)."
+fi
+
+if (( gpu_on == 0 )); then
+  log "GPU : desactive (GPU_MINER et GPU_ARGS vides)."
+  # CPU seul : la boucle XMRig tourne jusqu'a l'arret du conteneur.
+  while kill -0 "$cpu_sup" 2>/dev/null; do
+    wait "$cpu_sup"
+  done
+  exit 0
+fi
+
+# --- GPU : preparation puis keryx-miner ------------------------------------------
 check_connection
 [[ -n "$escrow_key" ]] && install_escrow_key
 recover_escrow
@@ -679,7 +811,6 @@ for m in "${wanted_models[@]}"; do
   fetch_model "$m"
 done
 
-# --- Lancement et relance --------------------------------------------------------
 log "GPU (keryx) : $(show_cmd "${gpu_cmd[@]}")"
 while true; do
   "${gpu_cmd[@]}" &

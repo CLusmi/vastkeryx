@@ -1,12 +1,17 @@
 # vastkeryx
 
-Image Docker pour miner du **Keryx** sur des machines louées sur **vast.ai** (GPU NVIDIA),
-avec le mineur officiel [keryx-miner](https://github.com/Keryx-Labs/keryx-miner).
+Image Docker pour miner sur des machines louées sur **vast.ai** :
 
-Deux variables obligatoires : `GPU_MINER=keryx` et `GPU_ARGS`, qui contient les
-arguments de keryx-miner **tels quels**, dans sa syntaxe d'origine. L'image n'ajoute
-aucune option. Une troisième, facultative, `KERYX_ESCROW_KEY`, permet d'utiliser **la
-même clé escrow sur toutes les instances** (voir [plus bas](#clé-escrow-commune)).
+- **GPU NVIDIA** : du **Keryx** avec le mineur officiel
+  [keryx-miner](https://github.com/Keryx-Labs/keryx-miner) ;
+- **CPU** (facultatif) : du **Monero** (ou autre RandomX) avec
+  [XMRig](https://github.com/xmrig/xmrig), pour rentabiliser les cœurs de la location.
+
+Côté GPU : `GPU_MINER=keryx` et `GPU_ARGS`, qui contient les arguments de keryx-miner
+**tels quels**, dans sa syntaxe d'origine ; l'image n'y ajoute aucune option.
+`KERYX_ESCROW_KEY`, facultative, permet d'utiliser **la même clé escrow sur toutes les
+instances** (voir [plus bas](#clé-escrow-commune)). Côté CPU : `CPU_MINER=xmrig` et
+`CPU_ARGS`, comme dans rentingminers (voir [plus bas](#cpu--xmrig)).
 Image publiée : `clusmi/vastkeryx:latest` (publique).
 
 ## Comment l'image est construite
@@ -14,16 +19,18 @@ Image publiée : `clusmi/vastkeryx:latest` (publique).
 Le workflow GitHub (`.github/workflows/build.yml`) :
 
 1. cherche la **dernière release stable** de `Keryx-Labs/keryx-miner` (ou celle que tu
-   indiques dans le champ *version* de **Run workflow**, par exemple `v0.5.7-PoM`) ;
-2. télécharge l'archive Linux (`keryx-miner-<version>-linux-amd64.zip`) et **vérifie son
-   empreinte SHA-256** (celle que GitHub a enregistrée quand Keryx-Labs a publié le
-   fichier) : si elle ne correspond pas, la construction échoue ;
+   indiques dans le champ *version* de **Run workflow**, par exemple `v0.5.7-PoM`) et
+   celle de `xmrig/xmrig` ;
+2. télécharge les archives Linux (`keryx-miner-<version>-linux-amd64.zip`,
+   `xmrig-<version>-linux-static-x64.tar.gz`) et **vérifie leur empreinte SHA-256**
+   (celle que GitHub a enregistrée quand l'auteur a publié le fichier) : si elle ne
+   correspond pas, la construction échoue ;
 3. construit l'image (Ubuntu 24.04) et l'envoie sur Docker Hub sous **deux étiquettes** :
    `clusmi/vastkeryx:latest` et une étiquette datée, par exemple
    `clusmi/vastkeryx:2026-10-08-1800`.
 
-La version incluse s'affiche dans le résumé du workflow, et au démarrage du conteneur.
-Pour passer à une nouvelle version du mineur, relance simplement le workflow, puis
+Les versions incluses s'affichent dans le résumé du workflow, et au démarrage du
+conteneur. Pour passer à de nouvelles versions des mineurs, relance simplement le workflow, puis
 `recycle` l'instance sur vast.ai pour qu'elle re-télécharge `latest`.
 
 ## Mise en place (une seule fois)
@@ -43,11 +50,14 @@ que le mineur (voir [plus bas](#modèle-ia--téléchargement-rapide)).
 | `GPU_MINER` | `keryx` (seule valeur) | |
 | `GPU_ARGS` | | arguments de keryx-miner, tels quels |
 | `KERYX_ESCROW_KEY` | 64 caractères (facultatif) | contenu de ton fichier `escrow.key`, écrit dans le conteneur avant le lancement, jamais affiché |
-| `RESTART_DELAY` | `10` | secondes avant relance du mineur s'il s'arrête |
+| `CPU_MINER` | `xmrig` (seule valeur) | |
+| `CPU_ARGS` | | arguments de XMRig, tels quels (voir [plus bas](#cpu--xmrig) ce que l'image ajoute) |
+| `RESTART_DELAY` | `10` | secondes avant relance d'un mineur qui s'arrête |
 | `DRY_RUN` | | `1` : affiche les commandes finales sans rien lancer ni écrire |
 
-`GPU_MINER` et `GPU_ARGS` sont obligatoires tous les deux : si l'un manque, rien ne
-démarre et le log dit pourquoi.
+Un côté démarre seulement si **son mineur et ses arguments** sont renseignés tous les
+deux : GPU seul, CPU seul ou les deux. Si l'un des deux manque d'un côté, ou si rien
+n'est renseigné, rien ne démarre et le log dit pourquoi.
 
 Dans le template vast.ai, le plus simple est la section **Environment Variables** : une
 case pour le nom, une pour la valeur, **sans guillemets**. Dans le champ « Docker
@@ -56,6 +66,36 @@ le `-e` et des guillemets autour de la valeur. Si vast.ai garde ces guillemets d
 valeur, l'image les retire.
 
 Template prêt à copier : voir [TEMPLATES.txt](TEMPLATES.txt).
+
+## CPU : XMRig
+
+Pour miner sur le CPU en même temps que keryx-miner sur les GPU : `CPU_MINER=xmrig` et
+`CPU_ARGS` avec les arguments de XMRig, comme dans rentingminers, par exemple
+`--coin monero -o xmr.kryptex.network:7029 -u ADRESSE_MONERO/RENT -k`.
+
+Ce que l'image ajoute, sauf si c'est déjà dans `CPU_ARGS` :
+
+- `--randomx-no-numa` : dans un conteneur, XMRig ne peut pas placer sa mémoire par
+  processeur ; sans cette option il passe en mode lent sur les machines à plusieurs
+  processeurs (environ 10 fois moins de hashrate) ;
+- `--no-color` : logs lisibles dans vast.ai ;
+- `-t <nombre>` : les cœurs **alloués à l'instance** (pas ceux de toute la machine, que
+  XMRig compterait sinon). Le nombre s'affiche dans le log. Avec `-t`, `--threads`,
+  `--cpu-max-threads-hint` ou un fichier de config (`-c`), c'est ton réglage qui compte.
+
+Et deux comportements propres à cette image :
+
+- **priorité la plus basse** (`nice 19`) : keryx-miner a besoin du CPU à des moments
+  critiques (preuve de chaque bloc à environ 10 blocs par seconde, index du modèle au
+  démarrage, requêtes IA). XMRig ne prend que ce que keryx-miner laisse libre, pour ne
+  pas te faire perdre de blocs Keryx ;
+- **démarrage immédiat** : XMRig tourne dès le début, donc aussi pendant le test de
+  connexion, la récupération escrow et le téléchargement du modèle.
+
+Ses lignes de log commencent par `[cpu]`. S'il s'arrête, il est relancé après
+`RESTART_DELAY` secondes, sans toucher à keryx-miner (et inversement). Dans un
+conteneur, XMRig ne peut pas activer les « huge pages » : il le signale et perd un peu
+de hashrate, comme dans rentingminers.
 
 ## Clé escrow commune
 
@@ -155,10 +195,11 @@ haut.
   avec `--very-high` (Kimi, 30 Go) et 50 Go avec `--high` (deux modèles de 16 Go).
 - **Fichiers du mineur** (`escrow.key`, `escrow.cert`, `escrow_state.json`…) : ils sont
   écrits dans le dossier de travail du conteneur, `/opt/miners/work`.
-- **Logs** : tout ce qu'écrit keryx-miner apparaît dans les logs de l'instance vast.ai ;
-  les lignes de l'image commencent par `[vastkeryx]`.
-- **Relance** : si keryx-miner s'arrête, il est relancé après `RESTART_DELAY` secondes.
-  Un arrêt de l'instance lui est transmis proprement (SIGTERM).
+- **Logs** : tout ce qu'écrivent les mineurs apparaît dans les logs de l'instance
+  vast.ai ; les lignes de l'image commencent par `[vastkeryx]`, celles de XMRig par
+  `[cpu]`.
+- **Relance** : si un mineur s'arrête, il est relancé après `RESTART_DELAY` secondes.
+  Un arrêt de l'instance leur est transmis proprement (SIGTERM).
 
 ## Tester sans miner
 
